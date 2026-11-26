@@ -1,0 +1,113 @@
+# Authored for the sealed build: upstream camunda-spin builds and tests on
+# Jenkins only (.ci.cambpm: jdk 11, mvn 3.8, buildMavenAndDeployToMavenCentral),
+# so this workflow mirrors that job: the Maven wrapper (3.8.8) on JDK 11 running
+# `install` over the whole reactor, which runs every module's surefire suite.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # XmlDomMapJavaToXml*Test.shouldMapJavaToXml expect the +02:00 offset of
+      # Camunda's Jenkins agents (Europe/Berlin); the runner defaults to UTC.
+      TZ: Europe/Berlin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "11"
+          cache: maven
+
+      - name: Build and test (mvnw install)
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./mvnw -B -V install -Dtest='${{ inputs.test-filter }}' -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false
+          else
+            ./mvnw -B -V install
+          fi
+
+      - name: Test summary and skipped-test report
+        if: success() || failure()
+        shell: bash
+        run: |
+          cat > /tmp/skip_report.py <<'EOF'
+          import glob, os, re, sys
+          import xml.etree.ElementTree as ET
+
+          def reason_from_source(cls, meth):
+              short = cls.split('.')[-1]
+              rel = cls.replace('.', '/') + '.java'
+              srcs = glob.glob('*/src/test/java/' + rel)
+              if not srcs:
+                  return None
+              lines = open(srcs[0], encoding='utf-8').read().splitlines()
+              idx = None
+              for i, l in enumerate(lines):
+                  if re.search(r'\b(void|class)\s+' + re.escape(meth) + r'\b', l):
+                      idx = i
+                      break
+              if idx is None:
+                  for i, l in enumerate(lines):
+                      if re.search(r'\bclass\s+' + re.escape(short) + r'\b', l):
+                          idx = i
+                          break
+              if idx is None:
+                  return None
+              text = []
+              j = idx - 1
+              while j >= 0 and (lines[j].strip().startswith(('@', '*', '/*', '//')) or not lines[j].strip()):
+                  s = lines[j].strip()
+                  if s.startswith(('*', '/*', '//')):
+                      s = re.sub(r'^(/\*\*?|\*/?|//)\s*', '', s).strip()
+                      if s and not s.startswith('@author'):
+                          text.insert(0, s)
+                  if s.startswith('@Ignore(') :
+                      text.insert(0, s)
+                  j -= 1
+              return ' '.join(t for t in text if t and t != '/') or None
+
+          total = fail = err = skip = 0
+          skipped = []
+          for f in sorted(glob.glob('*/target/surefire-reports/TEST-*.xml')):
+              r = ET.parse(f).getroot()
+              total += int(r.get('tests', 0)); fail += int(r.get('failures', 0))
+              err += int(r.get('errors', 0)); skip += int(r.get('skipped', 0))
+              mod = f.split('/')[0]
+              for tc in r.iter('testcase'):
+                  s = tc.find('skipped')
+                  if s is not None:
+                      cls, name = tc.get('classname') or r.get('name'), tc.get('name')
+                      reason = s.get('message') or reason_from_source(cls, name) or 'upstream @Ignore without comment'
+                      skipped.append((mod, cls, name, reason))
+          print('==== SEAL TEST SUMMARY (all modules) ====')
+          print(f'Tests run: {total}, Passed: {total - fail - err - skip}, Failures: {fail}, Errors: {err}, Skipped: {skip}')
+          print('==== SKIPPED TESTS (upstream @Ignore / Assume, with reason) ====')
+          for mod, cls, name, reason in skipped:
+              print(f'SKIPPED [{mod}] {cls}.{name} -- {reason}')
+          if total == 0:
+              sys.exit('no surefire reports found')
+          EOF
+          python3 /tmp/skip_report.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: camunda-spin-dataformat-all
+          path: |
+            dataformat-all/target/camunda-spin-dataformat-all-*.jar
+            !dataformat-all/target/*-sources.jar
+            !dataformat-all/target/*-javadoc.jar
+          if-no-files-found: error
